@@ -1,0 +1,5 @@
+django>=5.0,<6.0
+requests==2.31.0
+python-decouple==3.8    # For managing SECRET_KEYS and tokens
+gunicorn==21.2.0        # For production (Hostinger/Render)
+psycopg2-binary==2.9.9  # For PostgreSQL database
