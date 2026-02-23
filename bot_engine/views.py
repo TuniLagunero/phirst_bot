@@ -7,6 +7,10 @@ from .models import HouseModel, Lead, Promo
 import re
 from django.utils import timezone
 import google.generativeai as genai
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 genai.configure(api_key=config('GEMINI_API_KEY'))
@@ -29,6 +33,10 @@ def get_gemini_response(user_text):
     - Fully finished upon turnover with gate, and fence.
     - Location is in Magalang, Pampanga, 5-10 mins from the town proper and public market.
     - Ready for occupancy or pre-selling.
+    - For calista mid monthly amortization is between 16-17k, For calista end is 19-20k, For calista pair is 26k-27, For unna 24-25k.
+    - Our earliest turnover is first quarter of 2027.
+    - What are the requirements? For locally employed- Two valid ids, proof of billing, Bank statement payroll 6 months latest, Payslips 6months latest, Cenomar or mar certificate, COEC. For Abroad or OFW- Two Valid ids, 8copies of notarized SPA or Consularizer SPA, Payslip 6months latest, bank statement 6months latest,proof of billing, coec,entry and exit stamp
+    - Calista mid reservation fee is 15,000, Calista end reservation fee is 20,000, Calista pair reservation fee is 30,000, Unna regular reservation fee is 25,000.
     
     RULES:
     1. Keep answers under 3 sentences.
@@ -42,10 +50,42 @@ def get_gemini_response(user_text):
         response = model.generate_content(full_prompt)
         return response.text
     except Exception as e:
-        print(f"Gemini Error: {e}")
+        # CRITICAL FIX: exc_info=True captures the full traceback in your server logs
+        logger.error(f"Gemini API Error: {e}", exc_info=True)
         return "Pasensya na, busy lang ang system. Type 'house' para sa models o 'start' para mag-simula uli."
 
 # --- HELPER FUNCTIONS ---
+
+def send_fb_image(psid, image_url):
+    """
+    Sends a standalone image attachment via Meta Graph API.
+    The image_url must be publicly accessible.
+    """
+    access_token = config('FB_PAGE_ACCESS_TOKEN')
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={access_token}"
+    
+    payload = {
+        "recipient": {"id": psid},
+        "message": {
+            "attachment": {
+                "type": "image",
+                "payload": {
+                    "url": image_url,
+                    "is_reusable": True
+                }
+            }
+        }
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        
+        # Log failures instead of printing them
+        if response.status_code != 200:
+            logger.error(f"Failed to send image to {psid}. Status: {response.status_code} | Error: {response.text}")
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Meta API Image Request Failed for {psid}: {e}", exc_info=True)
 
 def send_fb_message(recipient_id, message_text):
     url = f"https://graph.facebook.com/v21.0/me/messages?access_token={config('FB_PAGE_ACCESS_TOKEN')}"
@@ -73,9 +113,6 @@ def send_house_models(recipient_id, location_filter=None):
     elements = []
     today = timezone.now().date()
     
-    # FACTOR for 15 Years (Derived from your images: 0.0101427)
-    # We use this to show a "Starts at X/mo" price
-    amort_factor = 0.0101427 
 
     for house in houses:
         # --- CALCULATION LOGIC START ---
@@ -94,8 +131,11 @@ def send_house_models(recipient_id, location_filter=None):
         net_tcp = float(house.total_contract_price) - discount
         loan_amount = net_tcp * 0.90 # 90% Loanable
         
-        # 3. Calculate Estimated Monthly (15 Yrs)
-        est_monthly = loan_amount * amort_factor
+        # 3. THE FIX: Dynamic "Starts at" calculation (15 Yrs Bank Financing)
+        bank_rate = float(getattr(house, 'bank_interest_rate', 8.0))
+        
+        # Calculate exactly what the computation page will calculate
+        est_monthly = calculate_monthly_amortization(loan_amount, bank_rate, 15)
         # --- CALCULATION LOGIC END ---
 
         elements.append({
@@ -177,7 +217,15 @@ def send_quick_reply(recipient_id, text, options):
     }
     return requests.post(url, json=payload).json()
 
-# views.py
+def calculate_monthly_amortization(principal, annual_interest_rate, years):
+    """Calculates dynamic monthly amortization based on any interest rate."""
+    if annual_interest_rate <= 0:
+        return principal / (years * 12)
+    
+    monthly_rate = (annual_interest_rate / 100) / 12
+    total_months = years * 12
+    
+    return principal * (monthly_rate * (1 + monthly_rate)**total_months) / ((1 + monthly_rate)**total_months - 1)
 
 def ask_financing_type(recipient_id, house_id):
     """
@@ -223,11 +271,10 @@ def send_bank_computation(recipient_id, house_id):
 
         net_tcp = gross_tcp - discount
         
-        # --- D. BANK FORMULA (Strictly based on your images) ---
-        # DP is 10% of NET TCP
 
+
+        # --- D. BANK FORMULA ---
         dp_percent = float(house.downpayment_percent) / 100
-        
         total_dp = net_tcp * dp_percent
         dp_balance = total_dp - reservation_fee
         monthly_dp = dp_balance / 12  # 12 Months Term
@@ -235,10 +282,12 @@ def send_bank_computation(recipient_id, house_id):
         # Loan is 90% of NET TCP
         loan_amount = net_tcp * 0.90
         
-        # Factors from your sheet
-        monthly_15y = loan_amount * 0.0101427
-        monthly_10y = loan_amount * 0.0126676
-        monthly_05y = loan_amount * 0.0207584
+        # Using dynamic bank interest rate (defaulting to 8.0% if missing)
+        bank_rate = float(getattr(house, 'bank_interest_rate', 8.0))
+
+        monthly_15y = calculate_monthly_amortization(loan_amount, bank_rate, 15)
+        monthly_10y = calculate_monthly_amortization(loan_amount, bank_rate, 10)
+        monthly_05y = calculate_monthly_amortization(loan_amount, bank_rate, 5)
 
         # --- E. BUILD MESSAGE ---
         text = (
@@ -310,34 +359,24 @@ def send_pagibig_computation(recipient_id, house_id):
 
         net_tcp = gross_tcp - discount
 
-        # --- D. PAG-IBIG LOGIC (Derived from your PDF Files) ---
-        
-        # RULE 1: Determine DP % based on Model Name
-        # Unna = 20% DP
-        # Calista (Mid/End) = 15% DP
+
         dp_percent = float(house.pagibig_downpayment_percent) / 100
         loan_percent = 1.0 - dp_percent
 
-        # RULE 2: Calculate DP (16 Months Term)
+ 
         total_dp = net_tcp * dp_percent
         dp_balance = total_dp - reservation_fee
         monthly_dp = dp_balance / 16
 
-        # RULE 3: Calculate Loan Amount
+    
         loan_amount = net_tcp * loan_percent
         
-        # RULE 4: Amortization Factors (Interest Rate 6.25%)
-        # Derived from your sheets (e.g., 16,748.58 / 2,720,174.55)
-        factor_30y = 0.00615717
-        factor_25y = 0.00659670
-        factor_20y = 0.00730928
-        factor_15y = 0.00857423
-        factor_10y = 0.01122800
+ 
+        pagibig_rate = float(getattr(house, 'interest_rate', 9.0)) 
 
-        monthly_30y = loan_amount * factor_30y
-        monthly_20y = loan_amount * factor_20y
-        monthly_10y = loan_amount * factor_10y
-
+        monthly_30y = calculate_monthly_amortization(loan_amount, pagibig_rate, 30)
+        monthly_20y = calculate_monthly_amortization(loan_amount, pagibig_rate, 20)
+        monthly_10y = calculate_monthly_amortization(loan_amount, pagibig_rate, 10)
         # --- E. BUILD MESSAGE ---
         text = (
             f"🏠 **PAG-IBIG COMPUTATION**\n"
@@ -353,7 +392,6 @@ def send_pagibig_computation(recipient_id, house_id):
             f"👉 **Monthly DP: ₱{monthly_dp:,.2f}** /mo\n"
             f"──────────────────\n"
             f"🏠 **EST. MONTHLY AMORTIZATION:**\n"
-            f"(Based on 6.25% fixed for 3 yrs)\n"
             f"• 30 Years: ₱{monthly_30y:,.2f}\n"
             f"• 20 Years: ₱{monthly_20y:,.2f}\n"
             f"• 10 Years: ₱{monthly_10y:,.2f}\n"
@@ -402,7 +440,7 @@ def send_cash_computation(recipient_id, house_id):
         
         price_after_promo = gross_tcp - discount_promo
 
-        # 3. Apply Cash Discount from DB (No longer hardcoded)
+        # 3. Apply Cash Discount from DB
         cash_rate = float(house.cash_discount_percent) / 100
         cash_discount_amount = price_after_promo * cash_rate
         final_cash_price = price_after_promo - cash_discount_amount
@@ -453,9 +491,19 @@ def send_telegram_alert(message_text):
         "text": message_text,
         "parse_mode": "Markdown"
     }
-    response = requests.post(url, json=payload)
-    # ADD THIS TO SEE WHY IT FAILS
-    print(f"TELEGRAM STATUS: {response.status_code} - {response.text}")
+    
+    try:
+        response = requests.post(url, json=payload)
+        
+        # PROPER LOGGING LOGIC
+        if response.status_code == 200:
+            logger.info(f"Telegram alert sent successfully to chat_id {chat_id}.")
+        else:
+            logger.error(f"Telegram API Failed. Status: {response.status_code} | Response: {response.text}")
+            
+    except requests.exceptions.RequestException as e:
+        # Catches network-level failures (e.g., your server loses internet connection)
+        logger.error(f"Failed to connect to Telegram API: {e}", exc_info=True)
 
 def pass_to_agent(psid):
     url = f"https://graph.facebook.com/v21.0/me/pass_thread_control?access_token={config('FB_PAGE_ACCESS_TOKEN')}"
@@ -505,12 +553,19 @@ def messenger_webhook(request):
 
                         # 1. GET OR CREATE LEAD IMMEDIATELY
                         lead, created = Lead.objects.get_or_create(psid=sender_id)
+                        user_msg_obj = messaging_event.get('message')
 
                         # 2. DEFINE ALL TEXT VARIABLES AT THE TOP
-                        user_msg_obj = messaging_event.get('message', {})
-                        user_text = user_msg_obj.get('text', '').strip()
+                        if user_msg_obj and 'attachments' in user_msg_obj:
+                            send_fb_message(sender_id, "Pasensya na, text and buttons lang muna ang kaya kong basahin. Please type your message or click an option. 😊")
+                            return HttpResponse("EVENT_RECEIVED", status=200)
+
+                        # Now it is safe to extract text (since we know it's not a standalone attachment)
+                        # We use {} as a fallback in case it's a postback event instead of a message
+                        safe_msg_obj = user_msg_obj or {} 
+                        user_text = safe_msg_obj.get('text', '').strip()
                         user_text_lower = user_text.lower()
-                        qr_payload = user_msg_obj.get('quick_reply', {}).get('payload')
+                        qr_payload = safe_msg_obj.get('quick_reply', {}).get('payload')
                         postback_payload = messaging_event.get('postback', {}).get('payload')
 
                         # 3. FETCH NAME IF MISSING (Fixes "Hi there" and "Name: None")
@@ -521,7 +576,20 @@ def messenger_webhook(request):
                                     lead.full_name = f"{profile['first_name']} {profile.get('last_name', '')}"
                                     lead.save()
                             except Exception as e:
-                                print(f"Error fetching profile: {e}")
+                                logger.error(f"Failed to fetch Meta profile for PSID {sender_id}. Error: {e}")
+
+                        # --- NEW: 3.5 THE GLOBAL RESET (Overrides everything else) ---
+                        if postback_payload in ['GET_STARTED', 'START_CHATTING']:
+                            # Force reset the database state
+                            lead.status = 'COLD'
+                            lead.current_step = 'ASKED_BUDGET'
+                            lead.save()
+                            
+                            first_name = lead.full_name.split()[0] if lead.full_name else "there"
+                            send_quick_reply(sender_id, f"Hi {first_name}! 👋 To help you find the best home, ano ang budget range mo?", [
+                                ("2M-3M", "BUDGET_2_3"), ("3M-4M", "BUDGET_3_4"), ("4M+", "BUDGET_4_UP")
+                            ])
+                            return HttpResponse("EVENT_RECEIVED", status=200)
 
                         # --- THE HARDENED GATEKEEPER & PHONE CAPTURE ---
                         if lead.status in ['HOT', 'WARM']:
@@ -577,31 +645,6 @@ def messenger_webhook(request):
                         if 'message' in messaging_event:
                             qr_payload = messaging_event['message'].get('quick_reply', {}).get('payload')
 
-                            # A. PHONE CAPTURE (Highest Priority)
-                            if is_ph_phone_number(user_text):
-                                lead.phone_number = user_text
-                                lead.current_step = 'COMPLETED'
-                                lead.save()
-
-                                # Determine what they were doing
-                                intent = "RESERVATION" if lead.status == 'HOT' else "TRIPPING"
-                                
-                                # 1. NOTIFY JERIC
-                                alert_msg = (
-                                    f"🔥 **HOT LEAD: {intent}**\n"
-                                    f"👤 Name: {lead.full_name}\n"
-                                    f"📞 Phone: {user_text}\n"
-                                    f"🏠 Unit: {lead.interested_house.name if lead.interested_house else 'N/A'}"
-                                )
-                                send_telegram_alert(alert_msg)
-
-                                # 2. CONFIRM TO USER
-                                send_fb_message(sender_id, f"Salamat! Na-save ko na ang number mo. Tatawagan ka ni Jeric para sa iyong {intent.lower()} shortly. 😊")
-                                
-                                # 3. HANDOVER
-                                pass_to_agent(sender_id)
-                                return HttpResponse("EVENT_RECEIVED", status=200)
-
                             # B. QUICK REPLIES (Financing & Funnel)
                             if qr_payload:
                                 if qr_payload.startswith('CALC_BANK_'):
@@ -614,14 +657,7 @@ def messenger_webhook(request):
                                     send_cash_computation(sender_id, qr_payload.replace('CALC_CASH_', ''))
                                 elif qr_payload.startswith('BUDGET_'):
                                     lead.budget_range = user_text
-                                    lead.current_step = 'ASKED_LOCATION'
-                                    lead.save()
-                                    send_quick_reply(sender_id, "Saan mo preferred na location?", [
-                                        ("Magalang", "LOC_MAGALANG"), ("Tanza", "LOC_TANZA"), ("GenTri", "LOC_GENTRI")
-                                    ])
-                                elif qr_payload.startswith('LOC_'):
-                                    lead.location_pref = user_text
-                                    lead.current_step = 'ASKED_FINANCING'
+                                    lead.current_step = 'ASKED_FINANCING' # Skip location entirely
                                     lead.save()
                                     send_quick_reply(sender_id, "Anong financing plan ang balak mo?", [
                                         ("Bank Financing", "FIN_BANK"), ("Cash", "FIN_CASH"), ("Pag-IBIG", "FIN_PAGIBIG")
@@ -643,6 +679,26 @@ def messenger_webhook(request):
                                 
                                 return HttpResponse("EVENT_RECEIVED", status=200)
 
+                            # --- NEW: MID-FUNNEL VALIDATION (The "Missing Buttons" Fix) ---
+                            if lead.current_step in ['ASKED_BUDGET', 'ASKED_FINANCING', 'ASKED_TIMELINE']:
+                                if not qr_payload and postback_payload not in ['VIEW_MODELS', 'TALK_TO_AGENT']:
+                                    error_msg = "Please use the buttons below para makapag-proceed tayo. 👇"
+                                    
+                                    if lead.current_step == 'ASKED_BUDGET':
+                                        send_quick_reply(sender_id, f"{error_msg}\n\nAno ang budget range mo?", [
+                                            ("2M-3M", "BUDGET_2_3"), ("3M-4M", "BUDGET_3_4"), ("4M+", "BUDGET_4_UP")
+                                        ])
+                                    elif lead.current_step == 'ASKED_FINANCING':
+                                        send_quick_reply(sender_id, f"{error_msg}\n\nAnong financing plan ang balak mo?", [
+                                            ("Bank Financing", "FIN_BANK"), ("Cash", "FIN_CASH"), ("Pag-IBIG", "FIN_PAGIBIG")
+                                        ])
+                                    elif lead.current_step == 'ASKED_TIMELINE':
+                                        send_quick_reply(sender_id, f"{error_msg}\n\nKailan mo balak kumuha ng unit?", [
+                                            ("ASAP", "TIME_ASAP"), ("1-3 Months", "TIME_1_3"), ("Just looking", "TIME_LOOKING")
+                                        ])
+                                    
+                                    return HttpResponse("EVENT_RECEIVED", status=200)
+
                             # C. INITIAL TRIGGERS
                             if user_text_lower in ['start', 'hello', 'hi']:
                                 first_name = lead.full_name.split()[0] if lead.full_name else "there"
@@ -653,13 +709,56 @@ def messenger_webhook(request):
                                 lead.save()
                             elif 'house' in user_text_lower:
                                 send_house_models(sender_id)
-                            else: # <--- THIS IS THE FINAL ELSE BLOCK
-                                # If the user is mid-funnel but sent a random text, redirect them
-                                if lead.current_step != 'COMPLETED' and lead.current_step != 'START':
-                                    send_fb_message(sender_id, "Please tap one of the options above para magpatuloy.")
-                                else:
-                                    ai_reply = get_gemini_response(user_text)
-                                    send_fb_message(sender_id, ai_reply)
+                            else: # <--- THE UNIFIED MEDIA INTERCEPTOR & GEMINI FALLBACK
+                                # 1. Expanded triggers to include video/tours
+                                media_triggers = ['pic', 'picture', 'photo', 'deliverable', 'turnover', 'mukha', 'itsura', 'model', 'video', 'vid', 'tour', 'virtual']
+                                
+                                is_asking_for_media = any(word in user_text_lower for word in media_triggers)
+                                
+                                if is_asking_for_media:
+                                    house_names = [house.name.lower() for house in HouseModel.objects.filter(is_active=True)]
+                                    target_house_name = next((name for name in house_names if name in user_text_lower), None)
+                                    
+                                    if target_house_name:
+                                        house = HouseModel.objects.get(name__iexact=target_house_name)
+                                        
+                                        # --- VIDEO LOGIC FIRST ---
+                                        if any(word in user_text_lower for word in ['video', 'vid', 'tour', 'virtual']):
+                                            if house.virtual_tour_link:
+                                                send_fb_message(sender_id, f"Eto po ang virtual tour video para sa {house.name}: {house.virtual_tour_link}")
+                                            else:
+                                                send_fb_message(sender_id, f"Pasensya na, wala pa kaming naka-upload na video para sa {house.name}. Pwede kitang i-connect kay Jeric para ma-assist ka.")
+                                            return HttpResponse("EVENT_RECEIVED", status=200)
+
+                                        # --- IMAGE LOGIC (Limited to 3 + Gallery Link) ---
+                                        if any(word in user_text_lower for word in ['turnover', 'deliverable', 'bare']):
+                                            images = house.images.filter(category='TURNOVER')[:3]
+                                            gallery_link = house.turnover_gallery_link
+                                            category_name = "turnover/deliverable unit"
+                                        else:
+                                            images = house.images.filter(category='DRESSED')[:3]
+                                            gallery_link = house.dressed_gallery_link
+                                            category_name = "dressed-up model unit"
+
+                                        if images.exists():
+                                            # Send Teaser Text
+                                            send_fb_message(sender_id, f"Eto po ang 3 pictures ng {category_name} ng {house.name}:")
+                                            
+                                            # Fire API for max 3 images
+                                            for img in images:
+                                                send_fb_image(sender_id, img.image_url)
+                                                
+                                            # Send Full Gallery Link if Jeric provided one
+                                            if gallery_link:
+                                                send_fb_message(sender_id, f"Para makita ang full gallery at iba pang pictures, click here: {gallery_link}")
+                                        else:
+                                            send_fb_message(sender_id, f"Pasensya na, wala pa akong hawak na picture para sa {house.name}. Pwede kitang i-connect kay Jeric.")
+                                        
+                                        return HttpResponse("EVENT_RECEIVED", status=200)
+                                
+                                # 2. If it's not a media request, let Gemini handle it
+                                ai_reply = get_gemini_response(user_text)
+                                send_fb_message(sender_id, ai_reply)
                             
                             return HttpResponse("EVENT_RECEIVED", status=200)
 
@@ -714,9 +813,9 @@ def messenger_webhook(request):
                                 house_id = payload.replace('RESERVE_', '')
                                 house = HouseModel.objects.get(id=house_id)
                                 
-                                # Tag lead as HOT so the phone capture knows it's a reservation
                                 lead.interested_house = house
                                 lead.status = 'HOT'
+                                lead.current_step = 'ASKED_PHONE' # <--- ADD THIS FIX
                                 lead.save()
                                 
                                 send_fb_message(sender_id, f"Great choice! Para sa {house.name}, please provide your contact number para ma-assist ka ni Jeric sa reservation process.")
@@ -727,14 +826,14 @@ def messenger_webhook(request):
                                 house_id = payload.replace('SCHEDULE_TRIPPING_', '')
                                 house = HouseModel.objects.get(id=house_id)
                                 
-                                # Tag lead as WARM for tripping
                                 lead.interested_house = house
                                 lead.status = 'WARM'
+                                lead.current_step = 'ASKED_PHONE' # <--- ADD THIS FIX
                                 lead.save()
                                 
                                 send_fb_message(sender_id, f"Noted! Send your phone number para ma-confirm ang tripping schedule mo para sa {house.name}.")
                                 return HttpResponse("EVENT_RECEIVED", status=200)
-
+                            
                             # HANDLE AGENT HANDOVER
                             elif payload == 'CHAT_WITH_AGENT':
                                 lead.status = 'WARM'

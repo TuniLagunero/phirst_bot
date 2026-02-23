@@ -1,5 +1,6 @@
 from django.db import models
 from django.utils import timezone
+from decimal import Decimal
 
 class HouseModel(models.Model):
     name = models.CharField(max_length=100, help_text="e.g., Unna Model")
@@ -24,8 +25,19 @@ class HouseModel(models.Model):
         default=15.00,
         verbose_name="Pag-IBIG DP % (15 or 20)"
     )
-    loan_term_years = models.IntegerField(default=20)
-    interest_rate = models.DecimalField(max_digits=5, decimal_places=2, default=7.00)
+
+    interest_rate = models.DecimalField(
+        max_digits=5, 
+        decimal_places=2, 
+        default=Decimal('9.00'), 
+        help_text="Pag-IBIG annual interest rate in percent (e.g., 9.00 for 9%)"
+    )
+    bank_interest_rate = models.DecimalField(
+        max_digits=5, 
+        decimal_places=2, 
+        default=Decimal('8.00'), 
+        help_text="Bank annual interest rate in percent (e.g., 8.00 for 8%)"
+    )
 
     cash_discount_percent = models.DecimalField(
         max_digits=5, 
@@ -46,12 +58,31 @@ class HouseModel(models.Model):
         default='Magalang'
     )
 
+    # --- NEW: MEDIA LINKS ---
+    turnover_gallery_link = models.URLField(max_length=500, blank=True, null=True, help_text="Link to the full FB album for Turnover/Bare units")
+    dressed_gallery_link = models.URLField(max_length=500, blank=True, null=True, help_text="Link to the full FB album for Dressed/Model units")
+    virtual_tour_link = models.URLField(max_length=500, blank=True, null=True, help_text="Link to the Facebook or YouTube virtual tour video")
+
     # REMOVED: @property def monthly_amortization
     # Why: It calculates based on the raw price and ignores promos. 
     # We will handle the exact calculation in views.py to ensure accuracy.
 
     def __str__(self):
         return self.name
+
+class HouseImage(models.Model):
+    CATEGORY_CHOICES = (
+        ('TURNOVER', 'Turnover / Deliverable Unit'),
+        ('DRESSED', 'Dressed-up / Model Unit'),
+    )
+    
+    # The ForeignKey links multiple images to a single HouseModel
+    house = models.ForeignKey(HouseModel, related_name='images', on_delete=models.CASCADE)
+    image_url = models.URLField(max_length=500, help_text="Public URL (e.g., from Imgur or Cloudinary)")
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES)
+
+    def __str__(self):
+        return f"{self.house.name} - {self.category}"
 
 class Lead(models.Model):
     # ... (Your Lead model is perfect, no changes needed) ...
@@ -77,6 +108,8 @@ class Lead(models.Model):
     budget_range = models.CharField(max_length=50, blank=True, null=True)
     location_pref = models.CharField(max_length=100, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    followed_up = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.full_name or 'Unknown'} - {self.interested_house}"
