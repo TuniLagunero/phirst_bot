@@ -8,6 +8,8 @@ import re
 from django.utils import timezone
 import google.generativeai as genai
 import logging
+import hmac
+import hashlib
 
 
 logger = logging.getLogger(__name__)
@@ -193,6 +195,30 @@ def is_ph_phone_number(text):
     # Matches 09xxxxxxxxx or +639xxxxxxxxx
     pattern = r"^(09|\+639)\d{9}$"
     return bool(re.match(pattern, text.strip()))
+
+def verify_meta_signature(raw_payload, signature_header):
+    """
+    Validates the X-Hub-Signature-256 header sent by Meta using HMAC-SHA256.
+    """
+    if not signature_header:
+        return False
+        
+    app_secret = config('META_APP_SECRET', default='')
+    if not app_secret:
+        logger.error("META_APP_SECRET is missing from environment variables.")
+        return False
+
+    # Meta requires the hash to be prefixed with 'sha256='
+    expected_hash = hmac.new(
+        app_secret.encode('utf-8'), 
+        raw_payload, 
+        hashlib.sha256
+    ).hexdigest()
+    
+    expected_signature = f"sha256={expected_hash}"
+    
+    # Strictly use compare_digest to prevent timing attacks
+    return hmac.compare_digest(expected_signature, signature_header)
 
 def send_quick_reply(recipient_id, text, options):
     """
@@ -527,7 +553,18 @@ def messenger_webhook(request):
         return HttpResponse("Verification failed", status=403)
 
     elif request.method == 'POST':
-        data = json.loads(request.body.decode('utf-8'))
+        # --- 1. THE GATEKEEPER: VALIDATE SIGNATURE ---
+        raw_body = request.body
+        signature_header = request.headers.get('X-Hub-Signature-256')
+
+        if not verify_meta_signature(raw_body, signature_header):
+            logger.warning(f"Unauthorized payload blocked. Invalid signature: {signature_header}")
+            # Drop the connection immediately if the signature is invalid or missing
+            return HttpResponse("Forbidden", status=403)
+
+        # --- 2. SAFE PARSING ---
+        # If the code reaches here, the payload is 100% verified to be from Meta
+        data = json.loads(raw_body.decode('utf-8'))
         
         if data.get('object') == 'page':
             for entry in data.get('entry', []):
